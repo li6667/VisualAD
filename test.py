@@ -49,6 +49,10 @@ def test(args):
     args.backbone = checkpoint.get("backbone", "ViT-L/14@336px")
     args.image_size = checkpoint.get("image_size", 518)
     args.features_list = checkpoint.get("features_list", [6, 12, 18, 24])
+    # ATS-ViT：是否启用 ATS-SAF 由 checkpoint 决定（可用 --use_ats 强制覆盖）
+    uses_ats = bool(checkpoint.get("uses_ats", False)) or bool(getattr(args, "use_ats", False))
+    ats_config = checkpoint.get("ats_config", {}) or {}
+    use_spectral = bool(ats_config.get("use_spectral", True))
 
     preprocess, target_transform = get_transform(args)
 
@@ -74,15 +78,29 @@ def test(args):
     if "layer_transforms" in checkpoint:
         for layer_name, state_dict in checkpoint["layer_transforms"].items():
             hidden_dim = state_dict['mlp.0.weight'].shape[0]
-            layer_transforms[layer_name] = create_feature_transform(
-                transform_type="mlp",
-                input_dim=feature_dim,
-                hidden_dim=hidden_dim,
-                output_dim=feature_dim,
-                dropout=0.0
-            ).to(device)
-            layer_transforms[layer_name].load_state_dict(state_dict)
-            layer_transforms[layer_name].eval()
+            if uses_ats:
+                from utils.ats_module import create_ats_transform
+                module = create_ats_transform(
+                    input_dim=feature_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=feature_dim,
+                    dropout=0.0,
+                    reduction=int(ats_config.get("reduction", 16)),
+                    alpha_init=float(ats_config.get("alpha_init", 0.05)),
+                    use_spectral=use_spectral,
+                ).to(device)
+                module.load_state_dict(state_dict, strict=False)
+            else:
+                module = create_feature_transform(
+                    transform_type="mlp",
+                    input_dim=feature_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=feature_dim,
+                    dropout=0.0
+                ).to(device)
+                module.load_state_dict(state_dict)
+            module.eval()
+            layer_transforms[layer_name] = module
 
     # Load cross-attention
     cross_attn = None
@@ -98,6 +116,11 @@ def test(args):
         ).to(device)
         cross_attn.load_state_dict(checkpoint["cross_attn"])
         cross_attn.eval()
+
+    if uses_ats:
+        alphas = {n: round(float(t.ats.alpha), 4) for n, t in layer_transforms.items()
+                  if hasattr(t, "ats")}
+        logger.info(f"ATS-SAF enabled (spectral={use_spectral}), alpha per layer: {alphas}")
 
     # Test dataset
     test_data = Dataset(root=args.test_data_path, transform=preprocess,
@@ -150,8 +173,11 @@ def test(args):
 
                 transform_key = f'layer_{args.features_list[idx]}'
                 if transform_key in layer_transforms:
-                    B, N, D = patch_feature.shape
-                    patch_feature = layer_transforms[transform_key](patch_feature.view(-1, D)).view(B, N, D)
+                    if uses_ats:
+                        patch_feature = layer_transforms[transform_key](patch_feature)
+                    else:
+                        B, N, D = patch_feature.shape
+                        patch_feature = layer_transforms[transform_key](patch_feature.view(-1, D)).view(B, N, D)
 
                 anomaly_map = generate_anomaly_map_from_tokens(
                     anomaly_feat_norm, normal_feat_norm,
@@ -199,6 +225,8 @@ if __name__ == '__main__':
     parser.add_argument("--device", type=str, default="cuda:1", help="device to use")
     parser.add_argument("--enable_analysis", action="store_true", help="enable data analysis and visualization")
     parser.add_argument("--seed", type=int, default=42, help="random seed")
+    parser.add_argument("--use_ats", action="store_true",
+                        help="force-enable ATS-SAF even if checkpoint does not record it")
 
     args = parser.parse_args()
     setup_seed(args.seed)

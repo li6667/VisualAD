@@ -121,6 +121,8 @@ class SpatialBottleneckAttention(nn.Module):
         attn = torch.bmm(Q, K.transpose(1, 2)) * scale  # [B, num_anchors, N]
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
+        # 仅缓存供可视化使用（detach，不影响计算图）
+        self.last_attn = attn.detach()
 
         # 5. Aggregate Value
         aggregated = torch.bmm(attn, V)  # [B, num_anchors, C]

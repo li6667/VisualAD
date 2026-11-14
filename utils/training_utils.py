@@ -4,6 +4,7 @@ Training utility functions for VisualAD
 import torch
 import torch.nn as nn
 from .feature_transform import create_feature_transform
+from .ats_module import create_ats_transform
 
 
 def print_training_parameters(args, logger):
@@ -60,11 +61,27 @@ def create_optimizer(model, layer_transforms, args, cross_attn=None):
         })
 
     for transform in layer_transforms.values():
-        optimizer_params.append({
-            'params': transform.parameters(),
-            'lr': args.learning_rate * 0.1,
-            'weight_decay': 0.01
-        })
+        alpha_param = getattr(getattr(transform, "ats", None), "alpha", None)
+        if alpha_param is not None:
+            rest = [p for p in transform.parameters() if p is not alpha_param]
+            optimizer_params.append({
+                'params': rest,
+                'lr': args.learning_rate * 0.1,
+                'weight_decay': 0.01
+            })
+            # 残差标量 alpha 单独给 0.01x 学习率（梯度量级远大于 token），
+            # 并在 validate_gradients 里裁剪，防止首步就把 alpha 从 0.05 推飞
+            optimizer_params.append({
+                'params': [alpha_param],
+                'lr': args.learning_rate * 0.01,
+                'weight_decay': 0.0
+            })
+        else:
+            optimizer_params.append({
+                'params': transform.parameters(),
+                'lr': args.learning_rate * 0.1,
+                'weight_decay': 0.01
+            })
 
     if cross_attn is not None:
         optimizer_params.append({
@@ -76,16 +93,32 @@ def create_optimizer(model, layer_transforms, args, cross_attn=None):
     return torch.optim.AdamW(optimizer_params, betas=(0.9, 0.999))
 
 
-def setup_feature_transforms(features_list, device, feature_dim):
-    """Setup feature transformation modules"""
+def setup_feature_transforms(features_list, device, feature_dim,
+                             use_ats: bool = False, use_spectral: bool = True,
+                             alpha_init: float = 0.05):
+    """Setup feature transformation modules.
+
+    use_ats=False 时与原版 VisualAD 完全一致（单隐层 MLP）；
+    use_ats=True  时换成 ATSFeatureTransform（原 MLP + 频域高频残差分支）。
+    """
     layer_transforms = nn.ModuleDict()
     for layer_idx in features_list:
         hidden_dim = int(feature_dim * 1.0)
-        layer_transforms[f'layer_{layer_idx}'] = create_feature_transform(
-            transform_type="mlp", input_dim=feature_dim,
-            hidden_dim=hidden_dim,
-            output_dim=feature_dim, dropout=0.1
-        ).to(device)
+        if use_ats:
+            layer_transforms[f'layer_{layer_idx}'] = create_ats_transform(
+                input_dim=feature_dim,
+                hidden_dim=hidden_dim,
+                output_dim=feature_dim,
+                dropout=0.0,
+                alpha_init=alpha_init,
+                use_spectral=use_spectral,
+            ).to(device)
+        else:
+            layer_transforms[f'layer_{layer_idx}'] = create_feature_transform(
+                transform_type="mlp", input_dim=feature_dim,
+                hidden_dim=hidden_dim,
+                output_dim=feature_dim, dropout=0.1
+            ).to(device)
     return layer_transforms
 
 
@@ -122,11 +155,17 @@ def validate_gradients(model, logger, epoch):
         if check_for_nan(model.visual.normal_token.grad, "normal_token gradient", logger, epoch):
             return False
         torch.nn.utils.clip_grad_norm_([model.visual.normal_token], max_norm=1.0)
-    
+
+    # ATS 的 alpha 梯度裁剪（量级可达 1e2，不裁会一步跳飞）
+    alphas = [m.ats.alpha for m in getattr(model, "_ats_modules", []) if m.ats.alpha.grad is not None]
+    if alphas:
+        torch.nn.utils.clip_grad_norm_(alphas, max_norm=1.0)
+
     return True
 
 
-def save_checkpoint(model, layer_transforms, args, epoch, checkpoint_path, cross_attn=None):
+def save_checkpoint(model, layer_transforms, args, epoch, checkpoint_path, cross_attn=None,
+                    uses_ats: bool = False, ats_config=None):
     """Save model checkpoint"""
     transform_state_dict = {name: t.state_dict() for name, t in layer_transforms.items()}
 
@@ -141,8 +180,16 @@ def save_checkpoint(model, layer_transforms, args, epoch, checkpoint_path, cross
         "epoch": epoch,
         "backbone": args.backbone,
         "layer_transforms": transform_state_dict,
-        "transform_type": "mlp",
+        "transform_type": "ats_mlp" if uses_ats else "mlp",
+        "uses_ats": bool(uses_ats),
     }
+
+    if uses_ats:
+        checkpoint_data["ats_config"] = ats_config or {
+            "use_spectral": True,
+            "alpha_init": 0.05,
+            "reduction": 16,
+        }
 
     if cross_attn is not None:
         checkpoint_data["cross_attn"] = cross_attn.state_dict()

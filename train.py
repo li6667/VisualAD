@@ -158,6 +158,12 @@ def train(args):
     ).to(device)
     cross_attn.train()
 
+    ats_config = {
+        "use_spectral": not getattr(args, "ats_no_spectral", False),
+        "alpha_init": getattr(args, "ats_alpha_init", 0.05),
+        "reduction": getattr(args, "ats_reduction", 16),
+    }
+
     # Load dataset
     train_data = Dataset(root=args.train_data_path, transform=preprocess,
                        target_transform=target_transform, dataset_name=args.train_dataset)
@@ -165,10 +171,39 @@ def train(args):
 
     # Setup feature transforms and model training
     feature_dim = model.visual.embed_dim
-    layer_transforms = setup_feature_transforms(args.features_list, device, feature_dim)
+    layer_transforms = setup_feature_transforms(
+        args.features_list, device, feature_dim,
+        use_ats=getattr(args, "use_ats", False),
+        use_spectral=not getattr(args, "ats_no_spectral", False),
+        alpha_init=getattr(args, "ats_alpha_init", 0.05),
+    )
 
     setup_model_training(model)
 
+    # ---- warm start：从官方 VisualAD adapter 权重热启动（新增 ATS 参数 strict=False 忽略）----
+    if getattr(args, "pretrained_path", ""):
+        ckpt = torch.load(args.pretrained_path, map_location="cpu")
+        model.visual.anomaly_token.data = ckpt["anomaly_token"].to(device)
+        model.visual.normal_token.data = ckpt["normal_token"].to(device)
+        if "ln_post_weight" in ckpt and ckpt["ln_post_weight"] is not None:
+            model.visual.ln_post.load_state_dict({
+                "weight": ckpt["ln_post_weight"], "bias": ckpt["ln_post_bias"]})
+        loaded, skipped = 0, 0
+        for name, sd in ckpt.get("layer_transforms", {}).items():
+            if name in layer_transforms:
+                res = layer_transforms[name].load_state_dict(sd, strict=False)
+                loaded += 1
+                skipped += len(res.unexpected_keys)
+        if "cross_attn" in ckpt and cross_attn is not None:
+            cross_attn.load_state_dict(ckpt["cross_attn"], strict=True)
+        # 记录 ATS 的初始状态（alpha 应保持初始化值，便于审计"起点≈原版"）
+        alphas = {n: round(float(t.ats.alpha), 5) for n, t in layer_transforms.items()
+                  if hasattr(t, "ats")}
+        logger.info(f"warm start from {args.pretrained_path}: "
+                    f"{loaded} layer_transforms loaded (unexpected keys: {skipped}), "
+                    f"atl alphas={alphas}")
+
+    model._ats_modules = [m for m in layer_transforms.values() if hasattr(m, "ats")]
     optimizer = create_optimizer(model, layer_transforms, args, cross_attn=cross_attn)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epoch, eta_min=args.learning_rate * 0.1)
 
@@ -243,10 +278,14 @@ def train(args):
 
                     # Apply feature transform
                     if transform_key in layer_transforms:
-                        batch_size, num_patches, feat_dim = patch_feature.shape
-                        patch_feature_flat = patch_feature.view(-1, feat_dim)
-                        transformed_feature = layer_transforms[transform_key](patch_feature_flat)
-                        patch_feature = transformed_feature.view(batch_size, num_patches, feat_dim)
+                        if getattr(args, "use_ats", False):
+                            # ATS 需要 [B, N, C] 的空间结构做 2D FFT
+                            patch_feature = layer_transforms[transform_key](patch_feature)
+                        else:
+                            batch_size, num_patches, feat_dim = patch_feature.shape
+                            patch_feature_flat = patch_feature.view(-1, feat_dim)
+                            transformed_feature = layer_transforms[transform_key](patch_feature_flat)
+                            patch_feature = transformed_feature.view(batch_size, num_patches, feat_dim)
 
                     # Generate anomaly map (compute only once)
                     anomaly_map = generate_anomaly_map_from_tokens(
@@ -335,12 +374,14 @@ def train(args):
         if (epoch + 1) % args.save_freq == 0:
             save_checkpoint(model, layer_transforms, args, epoch + 1,
                           os.path.join(args.save_path, f'epoch_{epoch + 1}.pth'),
-                          cross_attn=cross_attn)
+                          cross_attn=cross_attn, uses_ats=getattr(args, 'use_ats', False),
+                          ats_config=ats_config)
 
     # Save final model
     final_ckp_path = os.path.join(args.save_path, 'final_model.pth')
     save_checkpoint(model, layer_transforms, args, args.epoch, final_ckp_path,
-                   cross_attn=cross_attn)
+                   cross_attn=cross_attn, uses_ats=getattr(args, 'use_ats', False),
+                   ats_config=ats_config)
 
     logger.info(f'Training completed! Model saved to {final_ckp_path}')
 
@@ -363,6 +404,17 @@ if __name__ == '__main__':
     parser.add_argument("--save_freq", type=int, default=1, help="save frequency")
     parser.add_argument("--seed", type=int, default=111, help="random seed")
     parser.add_argument("--device", type=str, default="cuda:1", help="device to use")
+    # ---- ATS-ViT ----
+    parser.add_argument("--use_ats", action="store_true",
+                        help="enable ATS-SAF (Anisotropic Texture-Suppressed SAF)")
+    parser.add_argument("--ats_no_spectral", action="store_true",
+                        help="ablation: only channel gating, no FFT DC/texture suppression")
+    parser.add_argument("--ats_alpha_init", type=float, default=0.05,
+                        help="initial value of the learnable residual scalar alpha")
+    parser.add_argument("--ats_reduction", type=int, default=16,
+                        help="channel-excitation bottleneck ratio")
+    parser.add_argument("--pretrained_path", type=str, default="",
+                        help="warm-start from a VisualAD/ATS adapter checkpoint")
 
     args = parser.parse_args()
     setup_seed(args.seed)
