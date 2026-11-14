@@ -5,40 +5,58 @@ import logging
 from skimage import measure
 
 def cal_pro_score(masks, amaps, max_step=200, expect_fpr=0.3):
-    binary_amaps = np.zeros_like(amaps, dtype=bool)
-    min_th, max_th = np.min(amaps), np.max(amaps)
+    """Per-Region Overlap (PRO) 曲线下面积。
+
+    与原实现的数值完全等价，但把 measure.label/regionprops 提到阈值循环之外：
+    掩码在整个阈值扫描过程中是不变的，原实现在 200 个阈值上重复做了 200*N 次
+    regionprops，是这里的主要瓶颈（DAGM/VisA 单类要跑十几分钟）。
+    """
+    masks = np.asarray(masks, dtype=np.float32)
+    amaps = np.asarray(amaps, dtype=np.float32)
+    n = len(amaps)
+    if n == 0:
+        return 0.0
+
+    regions_per_img = []
+    for i in range(n):
+        mask = masks[i]
+        if mask.sum() == 0:
+            regions_per_img.append(None)
+            continue
+        labeled = measure.label(mask)
+        regions_per_img.append([
+            (np.asarray(r.coords[:, 0]), np.asarray(r.coords[:, 1]), float(r.area))
+            for r in measure.regionprops(labeled)
+        ])
+
+    total_fp_pixels = float(np.sum(1.0 - masks))
+    min_th, max_th = float(np.min(amaps)), float(np.max(amaps))
     delta = (max_th - min_th) / max_step
     pros, fprs = [], []
     for th in np.arange(min_th, max_th, delta):
-        binary_amaps[:] = amaps > th
         pro = []
-        for i in range(len(amaps)):
-            mask = masks[i]
-            amap = binary_amaps[i]
-            if np.sum(mask) == 0:
-                continue  # Skip if no anomaly region
-            labeled_mask = measure.label(mask)
-            regions = measure.regionprops(labeled_mask)
-            for region in regions:
-                coords = region.coords
-                tp = np.sum(amap[coords[:, 0], coords[:, 1]])
-                pro.append(tp / region.area)
-        avg_pro = np.mean(pro) if pro else 0
-        pros.append(avg_pro)
-        fp = np.sum(binary_amaps * (1 - masks))
-        total_fp_pixels = np.sum(1 - masks)
-        fpr = fp / total_fp_pixels if total_fp_pixels != 0 else 0
-        fprs.append(fpr)
-    pros, fprs = np.array(pros), np.array(fprs)
+        for i in range(n):
+            regs = regions_per_img[i]
+            if not regs:
+                continue
+            amap = amaps[i]
+            for ys, xs, area in regs:
+                tp = int(np.sum(amap[ys, xs] > th))
+                pro.append(tp / area)
+        pros.append(float(np.mean(pro)) if pro else 0.0)
+        fp = float(np.sum((amaps > th) * (1.0 - masks)))
+        fprs.append(fp / total_fp_pixels if total_fp_pixels != 0 else 0.0)
+
+    pros, fprs = np.asarray(pros), np.asarray(fprs)
     valid = fprs <= expect_fpr
     if not np.any(valid):
         return 0.0
-    fpr_valid = fprs[valid]
-    pro_valid = pros[valid]
+    fpr_valid, pro_valid = fprs[valid], pros[valid]
     if len(fpr_valid) < 2:
         return 0.0
     fpr_norm = (fpr_valid - fpr_valid.min()) / (fpr_valid.max() - fpr_valid.min())
     return auc(fpr_norm, pro_valid)
+
 
 def compute_metrics(results, obj_list, logger):
     table_ls = []
