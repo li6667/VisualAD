@@ -15,7 +15,7 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-OUT = Path("/d/ls/Anomaly Detection/results_ats_vit")
+OUT = Path("D:/ls/Anomaly Detection/results_ats_vit")
 
 from scripts.generate_paper_figures import Pipeline  # noqa: E402
 

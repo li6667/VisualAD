@@ -35,8 +35,8 @@ from utils.feature_transform import create_feature_transform
 from utils.transforms import get_transform
 from utils.anomaly_detection import generate_anomaly_map_from_tokens
 
-DATA = Path("/d/ls/Anomaly Detection/datasets")
-OUT = Path("/d/ls/Anomaly Detection/results_ats_vit/figures")
+DATA = Path("D:/ls/Anomaly Detection/datasets")
+OUT = Path("D:/ls/Anomaly Detection/results_ats_vit/figures")
 OUT.mkdir(parents=True, exist_ok=True)
 DPI = 300
 
@@ -182,8 +182,9 @@ def pick_samples(n_per_set=2):
 
     # KSDD2 金属微裂纹
     ks = DATA / "ksdd2/Metal"
-    for i, f in enumerate(sorted((ks / "test/anomaly").glob("*.png"))[:n_per_set]):
-        add(f, ks / "ground_truth/anomaly" / f.name, "KSDD2")
+    ksd_imgs = sorted((ks / "test/anomaly").glob("*.bmp")) or sorted((ks / "test/anomaly").glob("*.png"))
+    for f in ksd_imgs[:n_per_set]:
+        add(f, ks / "ground_truth/anomaly" / (f.stem + ".png"), "KSDD2")
     # MVTec 金属子类
     for cls in ["metal_nut", "grid", "screw"]:
         d = DATA / f"mvtec/{cls}"
@@ -320,7 +321,7 @@ def fig_attention(pipe, img_p, out_png):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--baseline_ckpt", default=str(REPO / "weight/train_on_visa/CLIP.pth"))
-    ap.add_argument("--ats_ckpt", default=str(Path("/d/ls/Anomaly Detection/results_ats_vit/ckpt/finetune_ats.pth")))
+    ap.add_argument("--ats_ckpt", default=str(Path("D:/ls/Anomaly Detection/results_ats_vit/ckpt/finetune_ats.pth")))
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
 
@@ -344,15 +345,25 @@ def main():
     # (1) 原始冻结 ViT 特征：用 baseline 管线但把 SAF 置为恒等（等价"无变换"）
     combos = [("Original ViT", pipe_base, "identity"),
               ("+ SAF (VisualAD)", pipe_base, "saf"),
+              ("+ ATS-SAF, alpha=0 (control)", pipe_ats, "saf_zero_alpha"),
               ("+ ATS-SAF (Ours)", pipe_ats, "saf")]
     for title, pipe, mode in combos:
         orig = dict(pipe.layer_transforms.items())
+        saved_alpha = None
         if mode == "identity":
             pipe.layer_transforms = nn.ModuleDict({k: nn.Identity() for k in orig})
+        elif mode == "saf_zero_alpha":
+            saved_alpha = {k: float(m.ats.alpha) for k, m in orig.items() if hasattr(m, "ats")}
+            for m in orig.values():
+                if hasattr(m, "ats"):
+                    m.ats.alpha.data.zero_()
         try:
             X, y = collect_features(pipe, samples)
         finally:
             pipe.layer_transforms = nn.ModuleDict(orig)
+            if saved_alpha:
+                for k, v in saved_alpha.items():
+                    orig[k].ats.alpha.data.fill_(v)
         if X is None:
             continue
         Z, var = pca2d(X)

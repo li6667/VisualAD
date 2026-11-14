@@ -167,7 +167,12 @@ def train(args):
     # Load dataset
     train_data = Dataset(root=args.train_data_path, transform=preprocess,
                        target_transform=target_transform, dataset_name=args.train_dataset)
-    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_data, batch_size=args.batch_size, shuffle=True,
+        num_workers=getattr(args, "num_workers", 0),
+        persistent_workers=getattr(args, "num_workers", 0) > 0,
+        prefetch_factor=4 if getattr(args, "num_workers", 0) > 0 else None,
+    )
 
     # Setup feature transforms and model training
     feature_dim = model.visual.embed_dim
@@ -207,6 +212,10 @@ def train(args):
     optimizer = create_optimizer(model, layer_transforms, args, cross_attn=cross_attn)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epoch, eta_min=args.learning_rate * 0.1)
 
+    # 注意：不要开 AMP。本仓库在梯度出现 NaN 时会 `continue` 跳过 step，
+    # 而 GradScaler 每轮只能 unscale_ 一次，混用会抛
+    # RuntimeError: unscale_() has already been called ...
+    # 实测 AMP 下第 5 个 iteration 就会出现 anomaly_token 梯度 NaN。
     amp_enabled = False
     scaler = GradScaler(enabled=amp_enabled)
 
@@ -413,8 +422,11 @@ if __name__ == '__main__':
                         help="initial value of the learnable residual scalar alpha")
     parser.add_argument("--ats_reduction", type=int, default=16,
                         help="channel-excitation bottleneck ratio")
+    parser.add_argument("--ats_alpha_lr_mult", type=float, default=0.01,
+                        help="alpha 的学习率倍率（相对 args.learning_rate）")
     parser.add_argument("--pretrained_path", type=str, default="",
                         help="warm-start from a VisualAD/ATS adapter checkpoint")
+    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers (CPU 解码并行)")
 
     args = parser.parse_args()
     setup_seed(args.seed)

@@ -69,11 +69,12 @@ def create_optimizer(model, layer_transforms, args, cross_attn=None):
                 'lr': args.learning_rate * 0.1,
                 'weight_decay': 0.01
             })
-            # 残差标量 alpha 单独给 0.01x 学习率（梯度量级远大于 token），
-            # 并在 validate_gradients 里裁剪，防止首步就把 alpha 从 0.05 推飞
+            # 残差标量 alpha 单独一组学习率（梯度量级远大于 token），
+            # 默认 0.01x；可用 --ats_alpha_lr_mult 放大（配合梯度裁剪，不会推飞）
+            mult = float(getattr(args, "ats_alpha_lr_mult", 0.01))
             optimizer_params.append({
                 'params': [alpha_param],
-                'lr': args.learning_rate * 0.01,
+                'lr': args.learning_rate * mult,
                 'weight_decay': 0.0
             })
         else:
