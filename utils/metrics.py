@@ -45,19 +45,23 @@ def compute_metrics(results, obj_list, logger):
     for obj in obj_list:
         obj_data = results[obj]
         # Pixel-level data
-        gt_px, pr_px = [], []
-        masks, amaps = [], []
-        for mask_batch, anomaly_map_batch in zip(obj_data['imgs_masks'], obj_data['anomaly_maps']):
-            mask_np = mask_batch.squeeze().cpu().numpy()
-            amap_np = anomaly_map_batch.squeeze().cpu().numpy()
-            gt_px.extend(mask_np.flatten())
-            pr_px.extend(amap_np.flatten())
-            masks.append(mask_np)
-            amaps.append(amap_np)
-        gt_px = np.array(gt_px)
-        pr_px = np.array(pr_px)
-        masks = np.stack(masks)
-        amaps = np.stack(amaps)
+        # 注意：原实现用 `list.extend(numpy.flatten())` 累积逐像素值，单个类别
+        # （如 DAGM Class1：575 张 518x518）就会产生 1.5 亿个 Python float，
+        # 约 5GB+ 内存并触发 MemoryError。这里改为 numpy 拼接 + float32。
+        if obj_data['imgs_masks']:
+            masks = np.stack([
+                m.squeeze().cpu().numpy().astype(np.float32, copy=False)
+                for m in obj_data['imgs_masks']
+            ])
+            amaps = np.stack([
+                a.squeeze().cpu().numpy().astype(np.float32, copy=False)
+                for a in obj_data['anomaly_maps']
+            ])
+        else:
+            masks = np.zeros((0, 0), np.float32)
+            amaps = np.zeros((0, 0), np.float32)
+        gt_px = masks.ravel()
+        pr_px = amaps.ravel()
         # Sample-level data
         gt_sp = np.array(obj_data['gt_sp'])
         pr_sp = np.array(obj_data['pr_sp'])
