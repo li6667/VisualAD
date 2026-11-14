@@ -26,9 +26,12 @@ DS_DIR = {
     "BTAD": "btad", "VisA": "visa", "DTD-Synthetic": "dtd",
 }
 MODELS = {
-    "VisualAD": "finetune_baseline",
-    "ATS-ViT (Ours)": "finetune_ats",
+    "same_budget_baseline": "finetune_baseline",
+    "ATS-ViT": "finetune_ats",
+    "ATS-ViT-tuned": "ats_a0.05_lr0.1",
+    "ATS-ViT-a0.20": "ats_a0.20_lr0.1",
 }
+SKIP_SENTINEL = -50.0  # SKIP_PRO 时 PRO 记 -100
 METALS = ["cable", "grid", "metal_nut", "screw", "tile", "transistor"]
 
 
@@ -41,15 +44,19 @@ def load_summary(tag: str, ds_key: str, pro: bool = False):
 
 
 def get(model: str, ds: str, pro: bool = False):
-    """返回 7 项指标 [pix_auroc, pix_f1, pix_ap, pix_pro, img_auroc, img_f1, img_ap]。"""
+    """返回 7 项指标 [pix_auroc, pix_f1, pix_ap, pix_pro, img_auroc, img_f1, img_ap]。
+
+    pro=True 时优先取带 PRO 的补算结果；若该轮是 SKIP_PRO（PRO=-100）则视为缺失。
+    """
     tag = MODELS[model]
-    s = load_summary(tag, DS_DIR[ds], pro=pro)
-    if s and "mean" in s:
+    for want_pro in ((True, False) if pro else (False,)):
+        s = load_summary(tag, DS_DIR[ds], pro=want_pro)
+        if not s or "mean" not in s:
+            continue
         vals = [float(x) for x in s["mean"]]
-        if pro:
-            return vals
-    if s and not pro:
-        return [float(x) for x in s["mean"]]
+        if pro and vals[3] <= SKIP_SENTINEL:
+            continue
+        return vals
     return None
 
 
@@ -59,14 +66,19 @@ def baseline(ds: str):
 
 
 def fmt(v, dash="-"):
-    return dash if v is None else f"{v:.1f}"
+    if v is None:
+        return dash
+    if isinstance(v, float) and v <= SKIP_SENTINEL:
+        return "n/a"
+    return f"{v:.1f}"
 
 
 def delta(o, b):
     if o is None or b is None:
         return "n/a"
-    d = o - b
-    return f"{d:+.1f}"
+    if (isinstance(o, float) and o <= SKIP_SENTINEL) or (isinstance(b, float) and b <= SKIP_SENTINEL):
+        return "n/a"
+    return f"{o - b:+.1f}"
 
 
 def md_table(header, rows):
@@ -98,31 +110,28 @@ def main():
         encoding="utf-8")
 
     # ---------------- Table 1 / 2: image & pixel ----------------
+    def cols(ds, sl, pro):
+        out = [baseline(ds)[sl] if baseline(ds) else None]
+        out.append((get("same_budget_baseline", ds, pro=pro) or [None] * 7)[sl])
+        out.append((get("ATS-ViT", ds, pro=pro) or [None] * 7)[sl])
+        out.append((get("ATS-ViT-tuned", ds, pro=pro) or [None] * 7)[sl])
+        return out
+
     img_rows, pix_rows = [], []
     for ds in DATASETS:
-        b = baseline(ds)
-        o = get("ATS-ViT (Ours)", ds)
-        bo = b[4:] if b else None
-        po = b[:4] if b else None
-        if o:
-            oi, op = o[4:], o[:4]
-        else:
-            oi = op = None
-        img_rows.append([ds,
-                         *(fmt(x) for x in (bo or [None] * 3)),
-                         *(fmt(x) for x in (oi or [None] * 3))] +
-                        [", ".join(delta(o, bb) for o, bb in zip(oi or [None] * 3, bo or [None] * 3))])
-        pix_rows.append([ds,
-                         *(fmt(x) for x in (po or [None] * 4)),
-                         *(fmt(x) for x in (op or [None] * 4))] +
-                        [", ".join(delta(o, bb) for o, bb in zip(op or [None] * 4, po or [None] * 4))])
+        oi = cols(ds, slice(4, 7), False)
+        op = cols(ds, slice(0, 4), True)
+        img_rows.append([ds] + [", ".join(fmt(x) for x in c) if isinstance(c, list) else fmt(c) for c in oi]
+                        + [", ".join(delta(a, b) for a, b in zip(oi[2], oi[1]))])
+        pix_rows.append([ds] + [", ".join(fmt(x) for x in c) if isinstance(c, list) else fmt(c) for c in op]
+                        + [", ".join(delta(a, b) for a, b in zip(op[2], op[1]))])
 
-    hdr_img = ["Dataset", "VisualAD AUROC", "F1-max", "AP",
-               "Ours AUROC", "F1-max", "AP", "Δ(Ours-VisualAD)"]
-    hdr_pix = ["Dataset", "VisualAD AUROC", "F1-max", "AP", "PRO",
-               "Ours AUROC", "F1-max", "AP", "PRO", "Δ(Ours-VisualAD)"]
-    (TAB / "table1_image_level.md").write_text(md_table(hdr_img, img_rows), encoding="utf-8")
-    (TAB / "table2_pixel_level.md").write_text(md_table(hdr_pix, pix_rows), encoding="utf-8")
+    hdr_img = ["Dataset", "VisualAD 官方", "同预算基线", "ATS-ViT", "ATS-ViT (α-lr×10)", "Δ(ATS−同预算)"]
+    hdr_pix = ["Dataset", "VisualAD 官方", "同预算基线", "ATS-ViT", "ATS-ViT (α-lr×10)", "Δ(ATS−同预算)"]
+    title_img = "# 图像级（AUROC / F1-max / AP）" + chr(10) + chr(10)
+    title_pix = "# 像素级（AUROC / F1-max / AP / PRO）" + chr(10) + chr(10)
+    (TAB / "table1_image_level.md").write_text(title_img + md_table(hdr_img, img_rows), encoding="utf-8")
+    (TAB / "table2_pixel_level.md").write_text(title_pix + md_table(hdr_pix, pix_rows), encoding="utf-8")
     (TAB / "table1_image_level.tex").write_text(
         tex_table("Image-level zero-shot comparison (AUROC/F1-max/AP).", "tab:image", hdr_img, img_rows),
         encoding="utf-8")
