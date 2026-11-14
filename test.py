@@ -1,4 +1,13 @@
 import VisualAD_lib
+
+# --- Windows 兼容：控制台默认 GBK，遇到 emoji 会 UnicodeEncodeError（改了 stdout 编码）---
+import sys as _sys
+try:
+    if (_sys.stdout.encoding or "").lower().replace("-", "") != "utf8":
+        _sys.stdout.reconfigure(encoding="utf-8")
+        _sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -94,7 +103,8 @@ def test(args):
     test_data = Dataset(root=args.test_data_path, transform=preprocess,
                        target_transform=target_transform, dataset_name=args.test_dataset)
     test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False)
-    obj_list = test_data.obj_list
+    # 只统计 meta.json 中实际出现的类别（支持按类别分批评测，也避免空类 np.stack 崩溃）
+    obj_list = [o for o in test_data.obj_list if o in test_data.cls_names]
 
     results = {obj: {'gt_sp': [], 'pr_sp': [], 'imgs_masks': [], 'anomaly_maps': []} for obj in obj_list}
 
@@ -157,7 +167,8 @@ def test(args):
 
             results[cls_name]['anomaly_maps'].append(final_anomaly_map)
 
-            all_original_images.append(image.detach().cpu())
+            if args.enable_analysis:  # 仅在需要可视化时缓存原图，否则 VisA/MVTec 全量会吃掉 7GB+ 内存
+                all_original_images.append(image.detach().cpu())
             all_anomaly_maps.append(final_anomaly_map)
             all_gt_masks.append(gt_mask)
             all_cls_names.append(cls_name)

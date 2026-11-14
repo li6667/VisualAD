@@ -65,8 +65,8 @@ def compute_metrics(results, obj_list, logger):
         # Calculate metrics
         pixel_auroc = roc_auc_score(gt_px, pr_px) if gt_px.size else 0
         pixel_ap = average_precision_score(gt_px, pr_px) if gt_px.size else 0
-        # pixel_aupro = cal_pro_score(masks, amaps) if gt_px.size else 0
-        pixel_aupro = 0
+        # 论文报了 PRO（VisA 91.0 / MVTec 87.5），但官方代码把这一行注释掉了，导致表格里 PRO 恒为 0
+        pixel_aupro = cal_pro_score(masks, amaps) if gt_px.size else 0
         sample_auroc = roc_auc_score(gt_sp, pr_sp) if gt_sp.size else 0
         sample_ap = average_precision_score(gt_sp, pr_sp) if gt_sp.size else 0
         

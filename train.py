@@ -1,4 +1,13 @@
 import VisualAD_lib
+
+# --- Windows 兼容：控制台默认 GBK，遇到 emoji 会 UnicodeEncodeError（改了 stdout 编码）---
+import sys as _sys
+try:
+    if (_sys.stdout.encoding or "").lower().replace("-", "") != "utf8":
+        _sys.stdout.reconfigure(encoding="utf-8")
+        _sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 import torch
 from torch.cuda.amp import GradScaler, autocast
 import argparse
@@ -17,7 +26,12 @@ import os
 import random
 from utils.transforms import get_transform
 from utils.scoring import reduce_anomaly_map, DEFAULT_TOPK_RATIO
-torch.use_deterministic_algorithms(True,warn_only=False)
+# 注意：warn_only=False 会让 F.interpolate(mode='bilinear') 的反向传播直接抛
+# RuntimeError: upsample_bilinear2d_backward_out_cuda does not have a deterministic
+# implementation（任何 CUDA 环境都会崩），因此这里必须 warn_only=True。
+torch.use_deterministic_algorithms(True, warn_only=True)
+
+
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -26,7 +40,7 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     # Additional deterministic settings
-    torch.use_deterministic_algorithms(True, warn_only=False)
+    torch.use_deterministic_algorithms(True, warn_only=True)
     import os
     os.environ['PYTHONHASHSEED'] = str(seed)
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'

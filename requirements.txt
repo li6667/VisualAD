@@ -9,3 +9,17 @@ torchvision==0.15.1
 tqdm==4.65.0
 dash-table==5.0.0
 PyYAML==6.0.1
+
+# --- 以下为代码 import 了但原 requirements.txt 漏掉的依赖 ---
+# numpy 必须 <1.25：scipy==1.9.1 的上限，且 torch 2.0.0 不兼容 numpy 2.x
+numpy==1.24.4
+# 5.x 强制要求 numpy>=2，会和 torch 2.0 冲突，故钉在 4.8
+opencv-python==4.8.0.76
+matplotlib
+pandas
+ftfy
+regex
+tabulate
+Pillow
+# model_load.py 里 `from pkg_resources import packaging`，setuptools>=81 会移除 pkg_resources
+setuptools<81

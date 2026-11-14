@@ -43,3 +43,13 @@ logs/
 .env
 venv/
 env/
+.venv/
+.conda/
+
+# Local results / evaluation outputs
+results/
+test_results/
+*.json.tmp
+
+# Local datasets (keep out of git)
+datasets/
