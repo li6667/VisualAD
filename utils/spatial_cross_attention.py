@@ -27,6 +27,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+from .conv_adapter import NeighborResidual
+
 
 class SpatialBottleneckAttention(nn.Module):
     """
@@ -42,7 +44,8 @@ class SpatialBottleneckAttention(nn.Module):
         num_anchors: Anchor query count (default 8)
         dropout: Dropout rate (default 0.1)
     """
-    def __init__(self, embed_dim, num_anchors=8, dropout=0.1, max_patches=1536, res_scale_init=0.1):
+    def __init__(self, embed_dim, num_anchors=8, dropout=0.1, max_patches=1536, res_scale_init=0.1,
+                 use_conv_pe: bool = False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_anchors = num_anchors
@@ -81,6 +84,12 @@ class SpatialBottleneckAttention(nn.Module):
         # Residual scaling (initialized to configurable value, preserve original token capability)
         self.res_scale = nn.Parameter(torch.ones(1) * res_scale_init)
 
+        # SCA-C：3×3 邻域残差位置编码项（零初始化 ⇒ 默认与原版逐位一致）
+        self.use_conv_pe = bool(use_conv_pe)
+        if self.use_conv_pe:
+            self.conv_pe = NeighborResidual(embed_dim, kernel_size=3, use_norm=False,
+                                            zero_init=True, residual=False)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -102,6 +111,10 @@ class SpatialBottleneckAttention(nn.Module):
             enhanced_token: [B, embed_dim] enhanced token
         """
         B, N, C = patch_tokens.shape
+
+        if getattr(self, "use_conv_pe", False):
+            # SCA-C：P ← P + Conv1x1(GELU(DWConv3x3(P)))，零初始化时恒等
+            patch_tokens = patch_tokens + self.conv_pe(patch_tokens)
 
         # 1. Prepare Query (from learnable anchor points)
         # Expand anchor query to batch dimension
@@ -157,7 +170,7 @@ class LayerAdaptiveCrossAttention(nn.Module):
         dropout: Dropout rate
     """
     def __init__(self, layers, embed_dim, num_anchors=8, dropout=0.1, max_patches=1536,
-                 res_scale_init=0.1):
+                 res_scale_init=0.1, use_conv_pe: bool = False):
         super().__init__()
         self.layers = layers
 
@@ -169,7 +182,8 @@ class LayerAdaptiveCrossAttention(nn.Module):
                 num_anchors=num_anchors,
                 dropout=dropout,
                 max_patches=max_patches,
-                res_scale_init=res_scale_init
+                res_scale_init=res_scale_init,
+                use_conv_pe=use_conv_pe,
             )
 
     def forward(self, anomaly_token, normal_token, patch_tokens_list, layer_ids):
@@ -212,7 +226,8 @@ class LayerAdaptiveCrossAttention(nn.Module):
 
 
 def build_layer_adaptive_cross_attention(layers, embed_dim, num_anchors=8, dropout=0.1,
-                                          max_patches=1536, res_scale_init=0.1):
+                                          max_patches=1536, res_scale_init=0.1,
+                                          use_conv_pe: bool = False):
     """
     Factory function: Create Layer-Adaptive Cross-Attention module
 
@@ -233,7 +248,8 @@ def build_layer_adaptive_cross_attention(layers, embed_dim, num_anchors=8, dropo
         num_anchors=num_anchors,
         dropout=dropout,
         max_patches=max_patches,
-        res_scale_init=res_scale_init
+        res_scale_init=res_scale_init,
+        use_conv_pe=use_conv_pe,
     )
 
 

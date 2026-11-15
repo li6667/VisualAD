@@ -149,14 +149,19 @@ def train(args):
 
     # Spatial-Aware Cross-Attention
     from utils.spatial_cross_attention import build_layer_adaptive_cross_attention
-    cross_attn = build_layer_adaptive_cross_attention(
-        layers=args.features_list,
-        embed_dim=model.visual.embed_dim,
-        num_anchors=4,
-        dropout=0.1,
-        res_scale_init=0.01
-    ).to(device)
-    cross_attn.train()
+    if getattr(args, "no_sca", False):
+        # 消融 R1/R3：完全去掉 SCA 模块（token 不做空间增强）
+        cross_attn = None
+    else:
+        cross_attn = build_layer_adaptive_cross_attention(
+            layers=args.features_list,
+            embed_dim=model.visual.embed_dim,
+            num_anchors=4,
+            dropout=0.1,
+            res_scale_init=0.01,
+            use_conv_pe=getattr(args, "use_conv_sca", False),
+        ).to(device)
+        cross_attn.train()
 
     # Load dataset
     train_data = Dataset(root=args.train_data_path, transform=preprocess,
@@ -165,9 +170,42 @@ def train(args):
 
     # Setup feature transforms and model training
     feature_dim = model.visual.embed_dim
-    layer_transforms = setup_feature_transforms(args.features_list, device, feature_dim)
+    layer_transforms = setup_feature_transforms(
+        args.features_list, device, feature_dim,
+        use_conv_saf=getattr(args, "use_conv_saf", False),
+        conv_kernel=getattr(args, "conv_kernel", 3),
+        use_saf=not getattr(args, "no_saf", False),
+    )
 
     setup_model_training(model)
+
+    conv_config = {
+        "use_conv_sca": bool(getattr(args, "use_conv_sca", False)),
+        "use_conv_saf": bool(getattr(args, "use_conv_saf", False)),
+        "no_sca": bool(getattr(args, "no_sca", False)),
+        "no_saf": bool(getattr(args, "no_saf", False)),
+        "conv_kernel": int(getattr(args, "conv_kernel", 3)),
+    }
+
+    # ---- warm start：从官方 VisualAD adapter 热启动（消融各变体必须同初始化）----
+    if getattr(args, "pretrained_path", ""):
+        ckpt = torch.load(args.pretrained_path, map_location="cpu")
+        model.visual.anomaly_token.data = ckpt["anomaly_token"].to(device)
+        model.visual.normal_token.data = ckpt["normal_token"].to(device)
+        if ckpt.get("ln_post_weight") is not None:
+            model.visual.ln_post.load_state_dict({
+                "weight": ckpt["ln_post_weight"], "bias": ckpt["ln_post_bias"]})
+        loaded, skipped = 0, 0
+        for name, sd in ckpt.get("layer_transforms", {}).items():
+            if name in layer_transforms:
+                res = layer_transforms[name].load_state_dict(sd, strict=False)
+                loaded += 1
+                skipped += len(res.unexpected_keys)
+        if "cross_attn" in ckpt and cross_attn is not None:
+            res = cross_attn.load_state_dict(ckpt["cross_attn"], strict=False)
+            skipped += len(res.unexpected_keys)
+        logger.info(f"warm start from {args.pretrained_path}: {loaded} layer_transforms loaded, "
+                    f"{skipped} extra keys kept at init (conv/ATS params)")
 
     optimizer = create_optimizer(model, layer_transforms, args, cross_attn=cross_attn)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epoch, eta_min=args.learning_rate * 0.1)
@@ -243,10 +281,14 @@ def train(args):
 
                     # Apply feature transform
                     if transform_key in layer_transforms:
-                        batch_size, num_patches, feat_dim = patch_feature.shape
-                        patch_feature_flat = patch_feature.view(-1, feat_dim)
-                        transformed_feature = layer_transforms[transform_key](patch_feature_flat)
-                        patch_feature = transformed_feature.view(batch_size, num_patches, feat_dim)
+                        if getattr(args, "use_conv_saf", False):
+                            # SAF-C 需要 [B, N, C] 空间结构做 3×3 邻域
+                            patch_feature = layer_transforms[transform_key](patch_feature)
+                        else:
+                            batch_size, num_patches, feat_dim = patch_feature.shape
+                            patch_feature_flat = patch_feature.view(-1, feat_dim)
+                            transformed_feature = layer_transforms[transform_key](patch_feature_flat)
+                            patch_feature = transformed_feature.view(batch_size, num_patches, feat_dim)
 
                     # Generate anomaly map (compute only once)
                     anomaly_map = generate_anomaly_map_from_tokens(
@@ -335,12 +377,12 @@ def train(args):
         if (epoch + 1) % args.save_freq == 0:
             save_checkpoint(model, layer_transforms, args, epoch + 1,
                           os.path.join(args.save_path, f'epoch_{epoch + 1}.pth'),
-                          cross_attn=cross_attn)
+                          cross_attn=cross_attn, conv_config=conv_config)
 
     # Save final model
     final_ckp_path = os.path.join(args.save_path, 'final_model.pth')
     save_checkpoint(model, layer_transforms, args, args.epoch, final_ckp_path,
-                   cross_attn=cross_attn)
+                   cross_attn=cross_attn, conv_config=conv_config)
 
     logger.info(f'Training completed! Model saved to {final_ckp_path}')
 
@@ -363,6 +405,16 @@ if __name__ == '__main__':
     parser.add_argument("--save_freq", type=int, default=1, help="save frequency")
     parser.add_argument("--seed", type=int, default=111, help="random seed")
     parser.add_argument("--device", type=str, default="cuda:1", help="device to use")
+    # ---- Conv-ViT（SCA-C / SAF-C）----
+    parser.add_argument("--use_conv_sca", action="store_true",
+                        help="enable SCA-C: 3x3 neighborhood residual in SCA position encoding")
+    parser.add_argument("--use_conv_saf", action="store_true",
+                        help="enable SAF-C: 3x3 neighborhood residual after SAF")
+    parser.add_argument("--no_sca", action="store_true", help="ablation: remove SCA entirely")
+    parser.add_argument("--no_saf", action="store_true", help="ablation: remove SAF entirely")
+    parser.add_argument("--conv_kernel", type=int, default=3, help="depthwise conv kernel size")
+    parser.add_argument("--pretrained_path", type=str, default="",
+                        help="warm-start from a VisualAD adapter checkpoint (strict=False)")
 
     args = parser.parse_args()
     setup_seed(args.seed)

@@ -49,6 +49,11 @@ def test(args):
     args.backbone = checkpoint.get("backbone", "ViT-L/14@336px")
     args.image_size = checkpoint.get("image_size", 518)
     args.features_list = checkpoint.get("features_list", [6, 12, 18, 24])
+    # Conv-ViT：结构由 checkpoint 决定
+    conv_cfg = checkpoint.get("conv_config", {}) or {}
+    use_conv_sca = bool(conv_cfg.get("use_conv_sca", False))
+    use_conv_saf = bool(conv_cfg.get("use_conv_saf", False))
+    conv_kernel = int(conv_cfg.get("conv_kernel", 3))
 
     preprocess, target_transform = get_transform(args)
 
@@ -71,22 +76,31 @@ def test(args):
 
     # Load feature transforms
     layer_transforms = nn.ModuleDict()
-    if "layer_transforms" in checkpoint:
+    if "layer_transforms" in checkpoint and not conv_cfg.get("no_saf", False):
         for layer_name, state_dict in checkpoint["layer_transforms"].items():
             hidden_dim = state_dict['mlp.0.weight'].shape[0]
-            layer_transforms[layer_name] = create_feature_transform(
-                transform_type="mlp",
-                input_dim=feature_dim,
-                hidden_dim=hidden_dim,
-                output_dim=feature_dim,
-                dropout=0.0
-            ).to(device)
-            layer_transforms[layer_name].load_state_dict(state_dict)
-            layer_transforms[layer_name].eval()
+            if use_conv_saf:
+                from utils.conv_adapter import create_saf_conv
+                module = create_saf_conv(
+                    input_dim=feature_dim, hidden_dim=hidden_dim,
+                    output_dim=feature_dim, dropout=0.0, kernel_size=conv_kernel,
+                ).to(device)
+                module.load_state_dict(state_dict, strict=False)
+            else:
+                module = create_feature_transform(
+                    transform_type="mlp",
+                    input_dim=feature_dim,
+                    hidden_dim=hidden_dim,
+                    output_dim=feature_dim,
+                    dropout=0.0
+                ).to(device)
+                module.load_state_dict(state_dict)
+            module.eval()
+            layer_transforms[layer_name] = module
 
     # Load cross-attention
     cross_attn = None
-    if "cross_attn" in checkpoint:
+    if "cross_attn" in checkpoint and not conv_cfg.get("no_sca", False):
         from utils.spatial_cross_attention import build_layer_adaptive_cross_attention
         config = checkpoint.get("cross_attn_config", {})
         cross_attn = build_layer_adaptive_cross_attention(
@@ -94,10 +108,14 @@ def test(args):
             embed_dim=feature_dim,
             num_anchors=config.get("num_anchors", 4),
             dropout=config.get("dropout", 0.1),
-            res_scale_init=config.get("res_scale_init", 0.01)
+            res_scale_init=config.get("res_scale_init", 0.01),
+            use_conv_pe=use_conv_sca,
         ).to(device)
-        cross_attn.load_state_dict(checkpoint["cross_attn"])
+        cross_attn.load_state_dict(checkpoint["cross_attn"], strict=False)
         cross_attn.eval()
+
+    if use_conv_sca or use_conv_saf:
+        logger.info(f"Conv-ViT enabled: SCA-C={use_conv_sca}, SAF-C={use_conv_saf}, k={conv_kernel}")
 
     # Test dataset
     test_data = Dataset(root=args.test_data_path, transform=preprocess,
@@ -150,8 +168,11 @@ def test(args):
 
                 transform_key = f'layer_{args.features_list[idx]}'
                 if transform_key in layer_transforms:
-                    B, N, D = patch_feature.shape
-                    patch_feature = layer_transforms[transform_key](patch_feature.view(-1, D)).view(B, N, D)
+                    if use_conv_saf:
+                        patch_feature = layer_transforms[transform_key](patch_feature)
+                    else:
+                        B, N, D = patch_feature.shape
+                        patch_feature = layer_transforms[transform_key](patch_feature.view(-1, D)).view(B, N, D)
 
                 anomaly_map = generate_anomaly_map_from_tokens(
                     anomaly_feat_norm, normal_feat_norm,
