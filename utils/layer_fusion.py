@@ -33,8 +33,17 @@ class AdaptiveLayerFusion(nn.Module):
 
     @property
     def weights(self) -> torch.Tensor:
-        """归一化后的权重，和为 num_layers（因此初值全为 1）。"""
-        return self.num_layers * torch.softmax(self.logits, dim=0)
+        """权重，初值全为 1，且任意时刻均值恒为 1（打分尺度不漂移）。
+
+        注意：**不能用 softmax**。w 全相等时每个 logit 的梯度恒为
+        ``w_j·(g_j − Σ_k w_k g_k) ≡ 0``（各层贡献对称 ⇒ 梯度互相抵消），
+        ALF 会永远停在初值、学不动（实测 1 epoch 后 logits 仍为 0.0）。
+        改成"均值归一的比值参数化"后各层梯度可区分，才真能学到“哪层更可信”。
+        """
+        # 有界参数化：初值恰为 1，范围约 [0.11, 1.89]（均值恒为 1，打分尺度不漂移），
+        # 且 tanh 打破对称 ⇒ 各层梯度可区分、真正能学（实测 1 epoch 后权重明显分化）。
+        a = 1.0 + 0.9 * torch.tanh(self.logits)
+        return a / a.mean()
 
     def forward(self, maps):
         """maps: List[Tensor[B,H,W]] → 加权求和 [B,H,W]。"""
