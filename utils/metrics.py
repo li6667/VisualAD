@@ -1,3 +1,4 @@
+import os
 from sklearn.metrics import auc, roc_auc_score, average_precision_score, precision_recall_curve
 from tabulate import tabulate
 import numpy as np
@@ -88,7 +89,11 @@ def compute_metrics(results, obj_list, logger):
         pixel_auroc = roc_auc_score(gt_px, pr_px) if gt_px.size else 0
         pixel_ap = average_precision_score(gt_px, pr_px) if gt_px.size else 0
         # 论文报了 PRO（VisA 91.0 / MVTec 87.5），但官方代码把这一行注释掉了，导致表格里 PRO 恒为 0
-        pixel_aupro = cal_pro_score(masks, amaps) if gt_px.size else 0
+        # SKIP_PRO=1 时跳过 PRO（200 阈值扫描是最慢的一步，用于快速筛选轮）
+        if os.environ.get("SKIP_PRO", "0") == "1":
+            pixel_aupro = -100.0
+        else:
+            pixel_aupro = cal_pro_score(masks, amaps) if gt_px.size else 0
         sample_auroc = roc_auc_score(gt_sp, pr_sp) if gt_sp.size else 0
         sample_ap = average_precision_score(gt_sp, pr_sp) if gt_sp.size else 0
         

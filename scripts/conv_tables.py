@@ -134,40 +134,38 @@ def main():
         encoding="utf-8")
 
     # ---------------- Table 2 消融 ----------------
+    # 注意：DAGM 只对 Baseline / Full 跑过；均值统一只在 KSDD2+MVTec 上算，
+    # 避免"少一个数据集的行"均值被抬高而误导。
     configs = [("Baseline (SCA + SAF)", "baseline"),
                ("w/o SCA", "wo_sca"),
                ("w/o SAF", "wo_saf"),
                ("w/o both", "wo_both"),
-               ("Full (Ours)", "full")]
+               ("Full (SCA-C + SAF-C)", "full")]
     abl_rows = []
     for label, tag in configs:
-        vals, means = [], []
-        for name, sub, _ in DATASETS:
-            if sub not in ("ksdd2", "mvtec", "dagm"):
-                continue
-            v = get(tag, sub)
-            if v is None:
-                vals += ["—", "—"]
-            else:
-                vals += [fmt(v[4]), fmt(v[0])]
-                means.append((v[4], v[0]))
-        if means:
-            mi = sum(x[0] for x in means) / len(means)
-            mp = sum(x[1] for x in means) / len(means)
-            vals += [fmt(mi), fmt(mp)]
-        else:
-            vals += ["—", "—"]
-        abl_rows.append([label] + vals)
+        k = get(tag, "ksdd2")
+        m = get(tag, "mvtec")
+        dg = get(tag, "dagm")
+        km_img = (k[4] + m[4]) / 2 if (k and m) else None
+        km_pix = (k[0] + m[0]) / 2 if (k and m) else None
+        abl_rows.append([
+            label,
+            f"{fmt(k[4])} / {fmt(k[0])}" if k else "—",
+            f"{fmt(m[4])} / {fmt(m[0])}" if m else "—",
+            f"{fmt(dg[4])} / {fmt(dg[0])}" if dg else "—",
+            fmt(km_img), fmt(km_pix),
+        ])
 
-    h2 = ["Configuration",
-          "KSDD2 img", "KSDD2 pix", "MVTec img", "MVTec pix", "DAGM img", "DAGM pix",
-          "Mean img", "Mean pix"]
+    h2 = ["Configuration", "KSDD2 img / pix", "MVTec img / pix", "DAGM img / pix",
+          "Mean(K+M) img", "Mean(K+M) pix"]
     (TAB / "table2_ablation.md").write_text(
-        md(h2, abl_rows, "Table 2. Ablation (image / pixel AUROC; same init & budget)")
-        + "\n> 所有行均从官方 adapter 热启动、同数据同预算（VisA 1008 张 × 1 epoch），唯一差异是模块开关。\n",
+        md(h2, abl_rows, "Table 2. Ablation (image / pixel AUROC)")
+        + (chr(10) + "> 所有行均从官方 adapter 热启动、同数据同预算（VisA 1008 张 × 1 epoch），唯一差异是模块开关。"
+           + chr(10) + "> DAGM 只在 Baseline 与 Full 上评测（其余行为节省预算未跑，显示 “—”，未做任何估算）；"
+           + chr(10) + "> 均值列统一在 KSDD2 + MVTec 上计算，保证各行可比。" + chr(10)),
         encoding="utf-8")
     (TAB / "table2_ablation.tex").write_text(
-        tex("Module ablation (image / pixel AUROC), all variants share the same initialisation and budget.",
+        tex("Module ablation (image / pixel AUROC); all variants share the same initialisation and budget.",
             "tab:ablation", h2, abl_rows), encoding="utf-8")
 
     # ---------------- Table 3 金属子类 ----------------

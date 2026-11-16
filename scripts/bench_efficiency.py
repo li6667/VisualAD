@@ -15,9 +15,9 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-OUT = Path("D:/ls/Anomaly Detection/results_ats_vit")
+OUT = Path("D:/ls/Anomaly Detection/results_conv_vit")
 
-from scripts.generate_paper_figures import Pipeline  # noqa: E402
+from scripts.conv_figures import Pipeline  # noqa: E402
 
 
 def count_trainable(pipe) -> float:
@@ -54,8 +54,8 @@ def main():
     args = ap.parse_args()
 
     ckpts = {
-        "VisualAD (baseline)": str(REPO / "weight/train_on_visa/CLIP.pth"),
-        "ATS-ViT (Ours)": str(OUT / "ckpt/finetune_ats.pth"),
+        "Baseline (SCA + SAF)": str(OUT / "ckpt/baseline.pth"),
+        "SCA-C + SAF-C (Ours)": str(OUT / "ckpt/full.pth"),
     }
     res = {}
     for name, ck in ckpts.items():

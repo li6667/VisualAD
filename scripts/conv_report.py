@@ -106,21 +106,34 @@ def main():
 
     # ---------- 消融 ----------
     p("\n## 3. 消融（所有变体同初始化、同预算）\n")
-    p("| 配置 | KSDD2 img | MVTec img | DAGM img | Mean img | Mean pix | Δ vs Baseline(img) |")
+    p("| 配置 | KSDD2 img/pix | MVTec img/pix | DAGM img/pix | Mean(K+M) img | Mean(K+M) pix | Δ vs Baseline(img) |")
     p("|:--|--:|--:|--:|--:|--:|--:|")
     base_mean = None
     for label, tag in CONFIGS:
-        vals = [load(tag, sub) for _, sub in DATASETS]
-        k, m, dg = vals[0], vals[1], vals[2]
-        if k and m and dg:
-            mi = (k[4] + m[4] + dg[4]) / 3
-            mp = (k[0] + m[0] + dg[0]) / 3
+        k, m, dg = load(tag, "ksdd2"), load(tag, "mvtec"), load(tag, "dagm")
+        if k and m:
+            mi = (k[4] + m[4]) / 2
+            mp = (k[0] + m[0]) / 2
             if tag == "baseline":
                 base_mean = mi
             delta = f"{mi - base_mean:+.2f}" if base_mean is not None else "—"
-            p(f"| {label} | {fmt(k[4])} | {fmt(m[4])} | {fmt(dg[4])} | {mi:.1f} | {mp:.1f} | {delta} |")
+            p(f"| {label} | {fmt(k[4])} / {fmt(k[0])} | {fmt(m[4])} / {fmt(m[0])} | "
+              f"{(fmt(dg[4]) + ' / ' + fmt(dg[0])) if dg else '—'} | {mi:.1f} | {mp:.1f} | {delta} |")
         else:
-            p(f"| {label} | " + " | ".join(fmt(v[4]) if v else "—" for v in (k, m, dg)) + " | — | — | — |")
+            p(f"| {label} | — | — | — | — | — | — |")
+    p("\n> 均值统一在 KSDD2 + MVTec 上计算；DAGM 只在 Baseline/Full 上评测，未做估算。\n")
+
+    # ---------- 参数量-精度权衡（裁剪机会）----------
+    ba = OUT / "bench_all.json"
+    if ba.exists():
+        bj = json.loads(ba.read_text(encoding="utf-8"))
+        p(chr(10) + "### 参数量 / 延迟（本机实测）" + chr(10))
+        p("| 配置 | 可训练参数(M) | 延迟(ms) | FPS |" + chr(10) + "|:--|--:|--:|--:|")
+        for tag in ("baseline", "wo_sca", "wo_saf", "wo_both", "full"):
+            if tag in bj:
+                v = bj[tag]
+                p(f"| {tag} | {v['trainable_params_m']:.2f} | {v['latency_ms']:.1f} | {v['fps']:.2f} |")
+        p("")
 
     # ---------- 参数变化 ----------
     p("\n### 邻域残差是否真的学起来了\n")

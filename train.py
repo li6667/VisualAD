@@ -244,12 +244,17 @@ def train(args):
                 # Spatial-Aware Cross-Attention enhancement
                 patch_features_list = [pt[:, patch_start_idx:, :] for pt in patch_tokens]
 
-                adapted_list = cross_attn(
-                    anomaly_features, normal_features,
-                    patch_features_list, args.features_list
-                )
-                anomaly_features_list = [adapted['anomaly'] for adapted in adapted_list]
-                normal_features_list = [adapted['normal'] for adapted in adapted_list]
+                if cross_attn is not None:
+                    adapted_list = cross_attn(
+                        anomaly_features, normal_features,
+                        patch_features_list, args.features_list
+                    )
+                    anomaly_features_list = [adapted['anomaly'] for adapted in adapted_list]
+                    normal_features_list = [adapted['normal'] for adapted in adapted_list]
+                else:
+                    # 消融 R1/R3：没有 SCA 时直接用原始 token
+                    anomaly_features_list = [anomaly_features] * len(patch_tokens)
+                    normal_features_list = [normal_features] * len(patch_tokens)
 
                 # Contrastive Loss: Use enhanced features from last layer
                 final_anomaly_features = anomaly_features_list[-1]
