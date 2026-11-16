@@ -4,6 +4,7 @@ Training utility functions for VisualAD
 import torch
 import torch.nn as nn
 from .feature_transform import create_feature_transform
+from .conv_adapter import create_saf_conv
 
 
 def print_training_parameters(args, logger):
@@ -76,16 +77,31 @@ def create_optimizer(model, layer_transforms, args, cross_attn=None):
     return torch.optim.AdamW(optimizer_params, betas=(0.9, 0.999))
 
 
-def setup_feature_transforms(features_list, device, feature_dim):
-    """Setup feature transformation modules"""
+def setup_feature_transforms(features_list, device, feature_dim,
+                             use_conv_saf: bool = False, conv_kernel: int = 3,
+                             use_saf: bool = True):
+    """Setup feature transformation modules.
+
+    use_saf=False        -> 完全去掉 SAF 分支（消融 R2/R3，逐层变换退化为恒等）
+    use_conv_saf=True    -> SAF-C：原 MLP + 3×3 邻域残差（零初始化 ⇒ 起点与原版逐位一致）
+    两者都 False         -> 原版 SAF（与官方代码完全一致）
+    """
     layer_transforms = nn.ModuleDict()
+    if not use_saf:
+        return layer_transforms
     for layer_idx in features_list:
         hidden_dim = int(feature_dim * 1.0)
-        layer_transforms[f'layer_{layer_idx}'] = create_feature_transform(
-            transform_type="mlp", input_dim=feature_dim,
-            hidden_dim=hidden_dim,
-            output_dim=feature_dim, dropout=0.1
-        ).to(device)
+        if use_conv_saf:
+            layer_transforms[f'layer_{layer_idx}'] = create_saf_conv(
+                input_dim=feature_dim, hidden_dim=hidden_dim,
+                output_dim=feature_dim, dropout=0.0, kernel_size=conv_kernel,
+            ).to(device)
+        else:
+            layer_transforms[f'layer_{layer_idx}'] = create_feature_transform(
+                transform_type="mlp", input_dim=feature_dim,
+                hidden_dim=hidden_dim,
+                output_dim=feature_dim, dropout=0.1
+            ).to(device)
     return layer_transforms
 
 
@@ -126,7 +142,8 @@ def validate_gradients(model, logger, epoch):
     return True
 
 
-def save_checkpoint(model, layer_transforms, args, epoch, checkpoint_path, cross_attn=None):
+def save_checkpoint(model, layer_transforms, args, epoch, checkpoint_path, cross_attn=None,
+                    conv_config=None):
     """Save model checkpoint"""
     transform_state_dict = {name: t.state_dict() for name, t in layer_transforms.items()}
 
@@ -141,8 +158,14 @@ def save_checkpoint(model, layer_transforms, args, epoch, checkpoint_path, cross
         "epoch": epoch,
         "backbone": args.backbone,
         "layer_transforms": transform_state_dict,
-        "transform_type": "mlp",
+        "transform_type": "saf_conv" if (conv_config or {}).get("use_conv_saf") else "mlp",
     }
+
+    # Conv-ViT（SCA-C / SAF-C）配置，供 test.py 自动恢复结构
+    if conv_config:
+        checkpoint_data["conv_config"] = conv_config
+        checkpoint_data["uses_conv"] = bool(conv_config.get("use_conv_sca")
+                                            or conv_config.get("use_conv_saf"))
 
     if cross_attn is not None:
         checkpoint_data["cross_attn"] = cross_attn.state_dict()

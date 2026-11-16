@@ -26,6 +26,7 @@ import os
 import random
 from utils.transforms import get_transform
 from utils.scoring import reduce_anomaly_map, DEFAULT_TOPK_RATIO
+from utils.layer_fusion import AdaptiveLayerFusion, cross_layer_consistency
 # 注意：warn_only=False 会让 F.interpolate(mode='bilinear') 的反向传播直接抛
 # RuntimeError: upsample_bilinear2d_backward_out_cuda does not have a deterministic
 # implementation（任何 CUDA 环境都会崩），因此这里必须 warn_only=True。
@@ -98,7 +99,7 @@ def generate_anomaly_map_from_tokens(anomaly_features, normal_features, patch_to
     return anomaly_map
 
 
-def compute_classification_loss_V2(anomaly_maps_list, labels, device):
+def compute_classification_loss_V2(anomaly_maps_list, labels, device, fusion=None):
     """
     Compute classification loss aligned with test.py inference
     Uses segmentation scores directly without normalization (training doesn't need class-wise normalization)
@@ -113,7 +114,11 @@ def compute_classification_loss_V2(anomaly_maps_list, labels, device):
         return torch.tensor(0.0, device=device)
     
     # Sum anomaly maps from all layers (same as test.py)
-    final_anomaly_maps = torch.stack(anomaly_maps_list).sum(dim=0)  # [B, H, W]
+    # ALF：fusion=None 时与原版完全一致（直接相加）
+    if fusion is not None:
+        final_anomaly_maps = fusion(anomaly_maps_list)
+    else:
+        final_anomaly_maps = torch.stack(anomaly_maps_list).sum(dim=0)  # [B, H, W]
     
     # Reduce anomaly map with Top-K mean to stabilize classification score
     seg_scores = reduce_anomaly_map(
@@ -149,14 +154,19 @@ def train(args):
 
     # Spatial-Aware Cross-Attention
     from utils.spatial_cross_attention import build_layer_adaptive_cross_attention
-    cross_attn = build_layer_adaptive_cross_attention(
-        layers=args.features_list,
-        embed_dim=model.visual.embed_dim,
-        num_anchors=4,
-        dropout=0.1,
-        res_scale_init=0.01
-    ).to(device)
-    cross_attn.train()
+    if getattr(args, "no_sca", False):
+        # 消融 R1/R3：完全去掉 SCA 模块（token 不做空间增强）
+        cross_attn = None
+    else:
+        cross_attn = build_layer_adaptive_cross_attention(
+            layers=args.features_list,
+            embed_dim=model.visual.embed_dim,
+            num_anchors=4,
+            dropout=0.1,
+            res_scale_init=0.01,
+            use_conv_pe=getattr(args, "use_conv_sca", False),
+        ).to(device)
+        cross_attn.train()
 
     # Load dataset
     train_data = Dataset(root=args.train_data_path, transform=preprocess,
@@ -165,11 +175,56 @@ def train(args):
 
     # Setup feature transforms and model training
     feature_dim = model.visual.embed_dim
-    layer_transforms = setup_feature_transforms(args.features_list, device, feature_dim)
+    layer_transforms = setup_feature_transforms(
+        args.features_list, device, feature_dim,
+        use_conv_saf=getattr(args, "use_conv_saf", False),
+        conv_kernel=getattr(args, "conv_kernel", 3),
+        use_saf=not getattr(args, "no_saf", False),
+    )
 
     setup_model_training(model)
 
+    alf = AdaptiveLayerFusion(len(args.features_list)).to(device) if getattr(args, "use_alf", False) else None
+    clcr_lambda = float(getattr(args, "clcr_lambda", 0.5)) if getattr(args, "use_clcr", False) else 0.0
+
+    conv_config = {
+        "use_conv_sca": bool(getattr(args, "use_conv_sca", False)),
+        "use_conv_saf": bool(getattr(args, "use_conv_saf", False)),
+        "no_sca": bool(getattr(args, "no_sca", False)),
+        "no_saf": bool(getattr(args, "no_saf", False)),
+        "conv_kernel": int(getattr(args, "conv_kernel", 3)),
+        "use_alf": bool(getattr(args, "use_alf", False)),
+        "use_clcr": bool(getattr(args, "use_clcr", False)),
+        "clcr_lambda": float(getattr(args, "clcr_lambda", 0.5)),
+        "alf_logits": None if alf is None else alf.logits.detach().cpu(),
+    }
+
+    # ---- warm start：从官方 VisualAD adapter 热启动（消融各变体必须同初始化）----
+    if getattr(args, "pretrained_path", ""):
+        ckpt = torch.load(args.pretrained_path, map_location="cpu")
+        model.visual.anomaly_token.data = ckpt["anomaly_token"].to(device)
+        model.visual.normal_token.data = ckpt["normal_token"].to(device)
+        if ckpt.get("ln_post_weight") is not None:
+            model.visual.ln_post.load_state_dict({
+                "weight": ckpt["ln_post_weight"], "bias": ckpt["ln_post_bias"]})
+        loaded, skipped = 0, 0
+        for name, sd in ckpt.get("layer_transforms", {}).items():
+            if name in layer_transforms:
+                res = layer_transforms[name].load_state_dict(sd, strict=False)
+                loaded += 1
+                skipped += len(res.unexpected_keys)
+        if "cross_attn" in ckpt and cross_attn is not None:
+            res = cross_attn.load_state_dict(ckpt["cross_attn"], strict=False)
+            skipped += len(res.unexpected_keys)
+        logger.info(f"warm start from {args.pretrained_path}: {loaded} layer_transforms loaded, "
+                    f"{skipped} extra keys kept at init (conv/ATS params)")
+
     optimizer = create_optimizer(model, layer_transforms, args, cross_attn=cross_attn)
+    if alf is not None:
+        optimizer.add_param_group({'params': [alf.logits],
+                                   'lr': args.learning_rate * 0.1,
+                                   'weight_decay': 0.0})
+    _global_step = [0]
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epoch, eta_min=args.learning_rate * 0.1)
 
     amp_enabled = False
@@ -206,12 +261,17 @@ def train(args):
                 # Spatial-Aware Cross-Attention enhancement
                 patch_features_list = [pt[:, patch_start_idx:, :] for pt in patch_tokens]
 
-                adapted_list = cross_attn(
-                    anomaly_features, normal_features,
-                    patch_features_list, args.features_list
-                )
-                anomaly_features_list = [adapted['anomaly'] for adapted in adapted_list]
-                normal_features_list = [adapted['normal'] for adapted in adapted_list]
+                if cross_attn is not None:
+                    adapted_list = cross_attn(
+                        anomaly_features, normal_features,
+                        patch_features_list, args.features_list
+                    )
+                    anomaly_features_list = [adapted['anomaly'] for adapted in adapted_list]
+                    normal_features_list = [adapted['normal'] for adapted in adapted_list]
+                else:
+                    # 消融 R1/R3：没有 SCA 时直接用原始 token
+                    anomaly_features_list = [anomaly_features] * len(patch_tokens)
+                    normal_features_list = [normal_features] * len(patch_tokens)
 
                 # Contrastive Loss: Use enhanced features from last layer
                 final_anomaly_features = anomaly_features_list[-1]
@@ -243,10 +303,14 @@ def train(args):
 
                     # Apply feature transform
                     if transform_key in layer_transforms:
-                        batch_size, num_patches, feat_dim = patch_feature.shape
-                        patch_feature_flat = patch_feature.view(-1, feat_dim)
-                        transformed_feature = layer_transforms[transform_key](patch_feature_flat)
-                        patch_feature = transformed_feature.view(batch_size, num_patches, feat_dim)
+                        if getattr(args, "use_conv_saf", False):
+                            # SAF-C 需要 [B, N, C] 空间结构做 3×3 邻域
+                            patch_feature = layer_transforms[transform_key](patch_feature)
+                        else:
+                            batch_size, num_patches, feat_dim = patch_feature.shape
+                            patch_feature_flat = patch_feature.view(-1, feat_dim)
+                            transformed_feature = layer_transforms[transform_key](patch_feature_flat)
+                            patch_feature = transformed_feature.view(batch_size, num_patches, feat_dim)
 
                     # Generate anomaly map (compute only once)
                     anomaly_map = generate_anomaly_map_from_tokens(
@@ -262,7 +326,7 @@ def train(args):
                     # For Classification Loss (reuse same anomaly_map)
                     anomaly_maps_list.append(anomaly_map)
 
-                image_val = compute_classification_loss_V2(anomaly_maps_list, label, device)
+                image_val = compute_classification_loss_V2(anomaly_maps_list, label, device, fusion=alf)
                 if check_for_nan(image_val, "image_loss", logger, epoch):
                     return None
 
@@ -283,8 +347,18 @@ def train(args):
                     return None
 
                 total = sum(loss_components)
+
+                # CLCR：跨层一致性（λ 前 200 步线性 warmup）
+                if clcr_lambda > 0 and len(anomaly_maps_list) > 1:
+                    ramp = min(1.0, _global_step[0] / 200.0)
+                    cl = cross_layer_consistency(anomaly_maps_list, downsample=4)
+                    if check_for_nan(cl, "clcr_loss", logger, epoch):
+                        return None
+                    total = total + clcr_lambda * ramp * cl
+
                 return total, seg_val, image_val, token_relation_val
 
+            _global_step[0] += 1
             optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=amp_enabled):
                 result = compute_losses()
@@ -335,12 +409,12 @@ def train(args):
         if (epoch + 1) % args.save_freq == 0:
             save_checkpoint(model, layer_transforms, args, epoch + 1,
                           os.path.join(args.save_path, f'epoch_{epoch + 1}.pth'),
-                          cross_attn=cross_attn)
+                          cross_attn=cross_attn, conv_config=conv_config)
 
     # Save final model
     final_ckp_path = os.path.join(args.save_path, 'final_model.pth')
     save_checkpoint(model, layer_transforms, args, args.epoch, final_ckp_path,
-                   cross_attn=cross_attn)
+                   cross_attn=cross_attn, conv_config=conv_config)
 
     logger.info(f'Training completed! Model saved to {final_ckp_path}')
 
@@ -363,6 +437,22 @@ if __name__ == '__main__':
     parser.add_argument("--save_freq", type=int, default=1, help="save frequency")
     parser.add_argument("--seed", type=int, default=111, help="random seed")
     parser.add_argument("--device", type=str, default="cuda:1", help="device to use")
+    # ---- Conv-ViT（SCA-C / SAF-C）----
+    parser.add_argument("--use_conv_sca", action="store_true",
+                        help="enable SCA-C: 3x3 neighborhood residual in SCA position encoding")
+    parser.add_argument("--use_conv_saf", action="store_true",
+                        help="enable SAF-C: 3x3 neighborhood residual after SAF")
+    parser.add_argument("--no_sca", action="store_true", help="ablation: remove SCA entirely")
+    parser.add_argument("--no_saf", action="store_true", help="ablation: remove SAF entirely")
+    parser.add_argument("--conv_kernel", type=int, default=3, help="depthwise conv kernel size")
+    parser.add_argument("--use_alf", action="store_true",
+                        help="ALF: learnable layer-fusion weights (init == plain sum, bit-identical)")
+    parser.add_argument("--use_clcr", action="store_true",
+                        help="CLCR: cross-layer consistency regularization")
+    parser.add_argument("--clcr_lambda", type=float, default=0.5,
+                        help="weight of cross-layer consistency term")
+    parser.add_argument("--pretrained_path", type=str, default="",
+                        help="warm-start from a VisualAD adapter checkpoint (strict=False)")
 
     args = parser.parse_args()
     setup_seed(args.seed)
