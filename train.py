@@ -407,12 +407,16 @@ def train(args):
 
         # Save model checkpoint
         if (epoch + 1) % args.save_freq == 0:
+            if alf is not None:
+                conv_config["alf_logits"] = alf.logits.detach().cpu()
             save_checkpoint(model, layer_transforms, args, epoch + 1,
                           os.path.join(args.save_path, f'epoch_{epoch + 1}.pth'),
                           cross_attn=cross_attn, conv_config=conv_config)
 
     # Save final model
     final_ckp_path = os.path.join(args.save_path, 'final_model.pth')
+    if alf is not None:
+        conv_config["alf_logits"] = alf.logits.detach().cpu()
     save_checkpoint(model, layer_transforms, args, args.epoch, final_ckp_path,
                    cross_attn=cross_attn, conv_config=conv_config)
 
